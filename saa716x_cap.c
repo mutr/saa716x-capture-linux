@@ -114,6 +114,12 @@ static int saa716x_cap_init_reg(struct saa716x_dev *saa716x)
 	return 0;
 }
 
+static struct saa716x_capture_config startech_echdcap = {
+    .board_name = "StarTech ECHDCAP",
+    .vip_port = 0,
+    .vi_ctrl = 0x06080F8C,
+    .subdev = SAA716x_SUBDEV_ECHDCAP_RX,
+};
 
 /* Identify capture board type */
 static int saa716x_cap_board_identify(struct saa716x_dev *saa716x)
@@ -123,7 +129,10 @@ static int saa716x_cap_board_identify(struct saa716x_dev *saa716x)
 			saa716x->config->capture_config = hd1;
 			break;
 		case 3:	/* SAA7160ET */
-			if(saa716x->pdev->subsystem_vendor == SKNET){
+                        if (saa716x->pdev->subsystem_vendor == 0xf50a &&
+                            saa716x->pdev->subsystem_device == 0x12ab) {
+                            saa716x->config->capture_config = startech_echdcap;
+                        } else if(saa716x->pdev->subsystem_vendor == SKNET){
 				saa716x->config->capture_config = sknet;
 			} else {
 				saa716x->config->capture_config = generic_tda19978;
@@ -209,7 +218,6 @@ static int saa716x_cap_pci_probe(struct pci_dev *pdev, const struct pci_device_i
 	}
 
 	saa716x_gpio_init(saa716x);
-
 	err = saa716x_check_eeprom(saa716x);
 	if (err) {
 		dprintk(SAA716x_ERROR, 1, "SAA716x EEPROM check failed");
@@ -486,12 +494,14 @@ static struct saa716x_config saa716x_cap_generic_config = {
 	.i2c_mode		= SAA716x_I2C_MODE_POLLING,
 };
 
-
 /* Driver Registration*/
 static struct pci_device_id saa716x_cap_pci_table[] = {
 	MAKE_ENTRY(NXP_SEMICONDUCTOR,	0x0002, 	SAA7160, &saa716x_cap_generic_config),
 	MAKE_ENTRY(SKNET,				MONSTAR_X3, SAA7160, &saa716x_cap_generic_config),
 	MAKE_ENTRY(KWORLD,				KHE660,		SAA7160, &saa716x_cap_generic_config),
+
+        MAKE_ENTRY(0xf50a, 0x12ab, SAA7160, &saa716x_cap_generic_config),
+
 	{ }
 };
 MODULE_DEVICE_TABLE(pci, saa716x_cap_pci_table);

@@ -29,5 +29,7 @@ obj-$(CONFIG_DVB_SAA716X_HYBRID)	+= saa716x_hybrid.o
 obj-$(CONFIG_DVB_SAA716X_FF)		+= saa716x_ff.o
 obj-$(CONFIG_SAA716X_CAPTURE)		+= saa716x_capture.o
 obj-$(CONFIG_TDA19978)			+= tda19978.o
+obj-$(CONFIG_MST3367)                   += mst3367-drv.o
+obj-$(CONFIG_ECHDCAP_RX)                += echdcap_rx.o
 
 EXTRA_CFLAGS = -Idrivers/media/tuners/ -Idrivers/media/dvb-frontends/

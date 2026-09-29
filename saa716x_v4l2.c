@@ -32,9 +32,32 @@
 #include "saa716x_cap.h"
 #include "saa716x_v4l2.h"
 #include "saa716x_vip_reg.h"
+#include "mst3367-drv.h"
+#include "echdcap_rx.h"
+#include "saa716x_gpio_reg.h"
+#include "saa716x_greg_reg.h"
 
 static int video_vip_get_stream_params_tda19978(struct saa716x_stream *s);
 static int video_vip_get_stream_params_adv7611(struct saa716x_stream *s);
+static int video_vip_get_stream_params_echdcap(struct saa716x_stream *s);
+
+/*
+ * Debug-only overrides for live experimentation on the ECHDCAP board.
+ * Defaults reproduce the confirmed-correct values (0x06080F8C is what this
+ * card's own EEPROM STREAM_DEVICE record encodes; 0 means "don't do the
+ * extra 4th GPIO_WR write"). Only applied on the f50a:12ab subsystem path.
+ */
+static uint echdcap_vi_ctrl = 0x06080F8C;
+module_param(echdcap_vi_ctrl, uint, 0644);
+MODULE_PARM_DESC(echdcap_vi_ctrl, "debug override for GREG_VI_CTRL on ECHDCAP");
+
+static uint echdcap_board_init = 1;
+module_param(echdcap_board_init, uint, 0644);
+MODULE_PARM_DESC(echdcap_board_init, "debug: 0 = skip ECHDCAP GPIO reset/board init (keeps receiver state)");
+
+static uint echdcap_gpio_wr_extra;
+module_param(echdcap_gpio_wr_extra, uint, 0644);
+MODULE_PARM_DESC(echdcap_gpio_wr_extra, "debug: extra GPIO_WR write after reset sequence on ECHDCAP (0=skip)");
 
 static const u32 vi_ch[] = {
     VI0,
@@ -589,6 +612,8 @@ static int saa716x_cap_s_fmt_vid_cap(struct file *file, void *priv,
 	/* set vip parameters */
 	if (sd_type == SAA716x_SUBDEV_TDA19978) {
 		ret = video_vip_get_stream_params_tda19978(s);
+	} else if (sd_type == SAA716x_SUBDEV_ECHDCAP_RX) {
+		ret = video_vip_get_stream_params_echdcap(s);
 	} else {
 		ret = video_vip_get_stream_params_adv7611(s);
 	}
@@ -1019,6 +1044,56 @@ static int video_vip_get_stream_params_adv7611(struct saa716x_stream *s)
 	return 0;
 }
 
+/*
+ * VIP window parameters for the ECHDCAP receiver (0x48).
+ *
+ * Values are taken from a register snapshot of the vendor Windows driver
+ * while it was streaming 1920x1080p30 (VM passthrough, see TODO.md):
+ *   VI_MODE=0xd0020000 VIN_FORMAT=0x01004201 WIN_XYSTART=0x00040000
+ *   WIN_XYEND=0x07840437 PSU_FORMAT=0x000020a0 PSU_WINDOW=0x07800438
+ *   INT_ENABLE=0x3ff
+ * i.e. VIP_FMT_TYPE2, offset_x=4, offset_y=0, inclusive window end.
+ * Only 1080p30 is confirmed, other modes intentionally fail.
+ */
+static int video_vip_get_stream_params_echdcap(struct saa716x_stream *s)
+{
+	struct vip_stream_params *params = &s->vip_params;
+	struct v4l2_dv_timings *timings = &s->timings;
+	u8 cea861_vic;
+
+	if (timings->type == V4L2_DV_BT_656_1120 && (timings->bt.flags & V4L2_DV_FL_HAS_CEA861_VIC)) {
+		cea861_vic = timings->bt.cea861_vic;
+	} else {
+		return -1;
+	}
+
+	switch (cea861_vic) {
+	case 34: /* 1920x1080p30 */
+		params->source_format = VIP_FMT_TYPE2;
+		params->bits = 16;
+		params->samples = 1920;
+		params->lines = 1080;
+		params->pitch = 1920 * 2;
+		params->offset_x = 4;
+		params->offset_y = 0;
+		params->stream_flags = VIP_HD | VIP_WIN_END_INCL | VIP_PSU_FMT_NO_BIT31 |
+				       VIP_RST_ON_ERR | VIP_INT_SEQBRK;
+		break;
+	default:
+		return -1;
+	}
+
+	if (s->format.field == V4L2_FIELD_ALTERNATE) {
+		params->stream_flags |= VIP_FIELD_ALTERNATE;
+	} else if (s->format.field == V4L2_FIELD_SEQ_TB) {
+		params->stream_flags |= VIP_FIELD_SEQ;
+	} else if (s->format.field == V4L2_FIELD_INTERLACED) {
+		params->stream_flags |= (VIP_ODD_FIELD | VIP_EVEN_FIELD);
+	}
+
+	return 0;
+}
+
 /* Subdev & Platform data */
 static struct adv76xx_platform_data adv7611_pdata = {
 	.disable_cable_det_rst = 0,
@@ -1047,19 +1122,45 @@ static struct i2c_board_info tda19978_info = {
 	.addr = 0x4c,
 };
 
+static struct mst3367_platform_data mst3367_pdata = {
+	.some_value = 0,
+};
+
+static struct i2c_board_info mst3367_info = {
+	.type = "mst3367",
+	.addr = 0x4e,
+	.platform_data = &mst3367_pdata,
+};
+
+static struct i2c_board_info echdcap_rx_info = {
+	.type = "echdcap_rx",
+	.addr = ECHDCAP_RX_I2C_ADDR,
+};
+
 /*
 	Register subdevice and initialize it
 */
 static int saa716x_subdev_init(struct saa716x_dev *saa716x)
 {
 	struct saa716x_stream *s = &saa716x->saa716x_stream[0];
-	struct saa716x_i2c *i2c = &saa716x->i2c[SAA716x_I2C_BUS_A];
-	struct i2c_adapter *i2cadapter = &i2c->i2c_adapter;
+	struct saa716x_i2c *i2c;
+	struct i2c_adapter *i2cadapter;
 	struct i2c_board_info *board_info = NULL;
 	struct v4l2_subdev *sd;
 	enum saa716x_capture_subdev sd_type = saa716x->config->capture_config.subdev;
 
 	int err = 0;
+
+	if (sd_type == SAA716x_SUBDEV_MST3367 || sd_type == SAA716x_SUBDEV_ECHDCAP_RX)
+		i2c = &saa716x->i2c[1]; /* SAA716x I2C Core 1 */
+	else
+		i2c = &saa716x->i2c[0];
+
+	i2cadapter = &i2c->i2c_adapter;
+
+	printk(KERN_INFO
+		"saa716x_subdev_init: type=%d, using I2C adapter %d (%s)\n",
+		sd_type, i2cadapter->nr, i2cadapter->name);
 
     switch (sd_type)
 	{
@@ -1071,6 +1172,13 @@ static int saa716x_subdev_init(struct saa716x_dev *saa716x)
 		break;
 	case SAA716x_SUBDEV_ADV7611_AD9983:
 		board_info = &adv7611_info;
+		break;
+	case SAA716x_SUBDEV_MST3367:
+		board_info = &mst3367_info;
+		break;
+	case SAA716x_SUBDEV_ECHDCAP_RX:
+		board_info = &echdcap_rx_info;
+		break;
 	default:
 		break;
 	}
@@ -1152,12 +1260,51 @@ static int saa716x_subdev_init(struct saa716x_dev *saa716x)
 		default:
 			break;
 	}
-
-	err = v4l2_subdev_call(sd, video, s_dv_timings, &s->timings);
-    if (err)
+	if (sd_type != SAA716x_SUBDEV_MST3367 && sd_type != SAA716x_SUBDEV_ECHDCAP_RX) {
+		err = v4l2_subdev_call(sd, video, s_dv_timings, &s->timings);
+	if (err)
 		return err;
-	
+	}
 	return 0;
+}
+
+/*
+ * StarTech ECHDCAP board bring-up. GPIO_WR/GREG end values are the ones the
+ * vendor Windows driver leaves while streaming (register snapshot, TODO.md).
+ * The reset pulse on GPIO 16 re-initialises the 0x48 receiver; with
+ * echdcap_board_init=0 it is skipped so a receiver configured by another
+ * driver keeps its state.
+ */
+#define ECHDCAP_GPIO_OEN	0xfbec3f93
+#define ECHDCAP_GPIO_WR		0x0001c024
+
+static void echdcap_board_setup(struct saa716x_dev *saa716x)
+{
+	if (echdcap_board_init) {
+		SAA716x_EPWR(GPIO, GPIO_WR_MODE, 0);
+		SAA716x_EPWR(GPIO, GPIO_WR, 0);
+		SAA716x_EPWR(GPIO, GPIO_OEN, ECHDCAP_GPIO_OEN);
+		SAA716x_EPWR(GPIO, GPIO_WR, 0x00010004);
+		msleep(50);
+		SAA716x_EPWR(GPIO, GPIO_WR, 0x00000004);
+		msleep(50);
+		SAA716x_EPWR(GPIO, GPIO_WR, 0x00010004);
+		msleep(50);
+	}
+	/* Output value first, then direction, so no pin glitches low. */
+	SAA716x_EPWR(GPIO, GPIO_WR_MODE, 0);
+	SAA716x_EPWR(GPIO, GPIO_WR, echdcap_gpio_wr_extra ? echdcap_gpio_wr_extra : ECHDCAP_GPIO_WR);
+	SAA716x_EPWR(GPIO, GPIO_OEN, ECHDCAP_GPIO_OEN);
+
+	SAA716x_EPWR(GREG, GREG_PMCSR_DATA_2, 0x00000c00);
+	SAA716x_EPWR(GREG, GREG_VIDEO_IN_CTRL, 0);
+	if (echdcap_vi_ctrl != 0x06080F8C)
+		SAA716x_EPWR(GREG, GREG_VI_CTRL, echdcap_vi_ctrl);
+
+	printk(KERN_INFO "ECHDCAP: board init%s: GPIO WR=%08x OEN=%08x GREG VIDEO_IN_CTRL=%08x +0c=%08x\n",
+	       echdcap_board_init ? "" : " (no reset pulse)",
+	       SAA716x_EPRD(GPIO, GPIO_WR), SAA716x_EPRD(GPIO, GPIO_OEN),
+	       SAA716x_EPRD(GREG, GREG_VIDEO_IN_CTRL), SAA716x_EPRD(GREG, GREG_PMCSR_DATA_2));
 }
 
 /*
@@ -1259,7 +1406,12 @@ int saa716x_v4l2_init(struct saa716x_dev *saa716x)
 	if (ret)
 		goto free_hdl;
 
+	if (saa716x->pdev->subsystem_vendor == 0xf50a &&
+	    saa716x->pdev->subsystem_device == 0x12ab)
+		echdcap_board_setup(saa716x);
+
 	saa716x_subdev_init(saa716x);
+
 	dev_info(&saa716x->pdev->dev, "SAA716x Capture V4L2 Driver loaded\n");
 	return 0;
 

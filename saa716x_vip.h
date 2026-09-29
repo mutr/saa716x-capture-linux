@@ -15,7 +15,11 @@ enum vip_stream_flags {
 	VIP_FIELD_ALTERNATE	= 0x0008,
 	VIP_INTERLACED	= 0x0010,
 	VIP_HD			= 0x0100,
-	VIP_NO_SCALER		= 0x1000
+	VIP_NO_SCALER		= 0x1000,
+	VIP_WIN_END_INCL	= 0x2000,	/* WIN_XYEND line = offset_y + lines - 1 */
+	VIP_PSU_FMT_NO_BIT31	= 0x4000,	/* PSU_FORMAT = 0x000020A0 */
+	VIP_RST_ON_ERR		= 0x8000,	/* VI_MODE |= RST_ON_ERR */
+	VIP_INT_SEQBRK		= 0x10000	/* also enable FID/WIN sequence-break IRQs */
 };
 
 /*

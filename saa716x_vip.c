@@ -185,6 +185,8 @@ static int saa716x_vip_setparams(struct saa716x_dev *saa716x, int port,
 	}
 	
 	end_line = stream_params->offset_y + num_lines;
+	if (stream_params->stream_flags & VIP_WIN_END_INCL)
+		end_line--;
 
 	/* set device to normal operation */
 	SAA716x_EPWR(vi_port, VIP_POWER_DOWN, 0);
@@ -229,7 +231,10 @@ static int saa716x_vip_setparams(struct saa716x_dev *saa716x, int port,
 	
 	/* set packet YUY2 output format */
 	//SAA716x_EPWR(vi_port, PSU_FORMAT, 0x800000A1);
-	SAA716x_EPWR(vi_port, PSU_FORMAT, 0x800020A0);
+	if (stream_params->stream_flags & VIP_PSU_FMT_NO_BIT31)
+		SAA716x_EPWR(vi_port, PSU_FORMAT, 0x000020A0);
+	else
+		SAA716x_EPWR(vi_port, PSU_FORMAT, 0x800020A0);
 
 	SAA716x_EPWR(vi_port, PSU_BASE1, base_address);
 	SAA716x_EPWR(vi_port, PSU_PITCH1, pitch);
@@ -311,7 +316,8 @@ int saa716x_vip_start(struct saa716x_dev *saa716x, int port, int one_shot,
 		SAA716x_EPWR(MMU, config2, val | 0x40);
 	}
 
-	SAA716x_EPWR(vi_port, INT_ENABLE, 0x33F);
+	SAA716x_EPWR(vi_port, INT_ENABLE,
+		     (stream_params->stream_flags & VIP_INT_SEQBRK) ? 0x3FF : 0x33F);
 
 	i = 0;
 	while (i < 500) {
@@ -344,7 +350,8 @@ int saa716x_vip_start(struct saa716x_dev *saa716x, int port, int one_shot,
 	if (one_shot)
 		val |= VID_OSM; /* stop capture after receiving one frame */
 
-	//val |= RST_ON_ERR; // came from windows driver
+	if (stream_params->stream_flags & VIP_RST_ON_ERR)
+		val |= RST_ON_ERR;
 
 	saa716x_set_clk_external(saa716x, saa716x->vip[port].dma_channel[0]);
 
