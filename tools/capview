@@ -1,0 +1,69 @@
+#!/bin/bash
+# capview - show the ECHDCAP HDMI input; restart the viewer whenever the source changes mode.
+# usage: capview [device]
+#   VIEWER=mpv (default if installed): zoom +/- or mouse wheel, pan arrows, reset 0 or Backspace,
+#                                      fullscreen f, screenshot s (to ~), quit q  (~/bin/capview-input.conf)
+#   VIEWER=gst: plain GStreamer window.   MPV_OPTS=... extra mpv options.
+find_dev() {	# the saa716x capture node, whatever its number
+	local d
+	for d in /sys/class/video4linux/video*; do
+		[ "$(cat $d/name 2>/dev/null)" = saa716x_capture ] && { echo /dev/${d##*/}; return; }
+	done
+	echo /dev/video2
+}
+dev=${1:-$(find_dev)}
+viewer=${VIEWER:-$(command -v mpv >/dev/null && echo mpv || echo gst)}
+fifo=$(mktemp -u /tmp/capview.XXXXXX); mkfifo $fifo
+gpid=""; vpid=""; cur=""
+
+stop() {
+	[ -n "$vpid" ] && kill $vpid 2>/dev/null
+	[ -n "$gpid" ] && kill $gpid 2>/dev/null
+	wait $vpid $gpid 2>/dev/null; gpid=""; vpid=""
+}
+trap 'stop; rm -f $fifo; exit 0' INT TERM EXIT
+echo "capture device: $dev"
+
+if fuser -s $dev 2>/dev/null; then
+	echo "$dev is already open by: $(ps -o comm= -p $(fuser $dev 2>/dev/null) | tr '\n' ' ')- close it first"; exit 1
+fi
+
+mode() {	# prints "W H HTOTAL VTOTAL PCLK REDUCED" or "nosignal"
+	v4l2-ctl -d $dev --query-dv-timings 2>/dev/null | awk '
+		/Active width/ {w=$3} /Active height/ {h=$3} /Total width/ {tw=$3} /Total height/ {th=$3}
+		/Pixelclock/ {p=$2} /Flags:.*is reduced/ {r=1}
+		END {if (w) print w, h, tw, th, p, r+0; else print "nosignal"}'
+}
+
+start() {	# $1..$6 as printed by mode()
+	local W=$1 H=$2 fps
+	fps=$(awk -v p=$5 -v h=$3 -v v=$4 -v r=$6 'BEGIN{f=p/(h*v); if (r) f/=1.001; printf "%.3f", f}')
+	echo "$(date +%T) source ${W}x${H}p${fps} -> (re)starting $viewer"
+	if [ "$viewer" = gst ]; then
+		gst-launch-1.0 -q v4l2src device=$dev ! videoconvert ! autovideosink sync=false &
+		vpid=$!; return
+	fi
+	# GStreamer copes with the padded lines. A YUY2 -> YUY2 videoconvert is a passthrough that keeps
+	# the driver's padding (bytesperline > width*2), which mpv's rawvideo demuxer cannot know about;
+	# converting to UYVY forces a copy into tightly packed width*2*height frames.
+	gst-launch-1.0 -q v4l2src device=$dev ! videoconvert ! video/x-raw,format=UYVY ! fdsink fd=1 sync=false > $fifo &
+	gpid=$!
+	mpv --really-quiet --title="capview ${W}x${H}p${fps}" --no-cache --untimed --video-latency-hacks=yes \
+		--demuxer=rawvideo --demuxer-rawvideo-w=$W --demuxer-rawvideo-h=$H \
+		--demuxer-rawvideo-mp-format=uyvy422 --demuxer-rawvideo-fps=$fps \
+		--vf=format=colormatrix=bt.601:colorlevels=limited --input-conf="$(dirname "$0")/capview-input.conf" \
+		--screenshot-directory=~ $MPV_OPTS - < $fifo &
+	vpid=$!
+}
+
+while true; do
+	m=$(mode)
+	# the viewer died on its own (e.g. window closed by the user) -> quit
+	if [ -n "$vpid" ] && ! kill -0 $vpid 2>/dev/null; then echo "viewer exited"; exit 0; fi
+	if [ "$m" != "$cur" ]; then
+		sleep 1; [ "$(mode)" = "$m" ] || continue	# let the new mode settle
+		stop; cur=$m
+		if [ "$m" = nosignal ]; then echo "$(date +%T) no signal, waiting"; else start $m; fi
+	fi
+	sleep 1
+done

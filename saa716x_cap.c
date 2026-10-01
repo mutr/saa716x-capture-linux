@@ -35,7 +35,7 @@
 #include "saa716x_v4l2.h"
 #include "saa716x_debugfs.h"
 
-unsigned int verbose = 4;
+unsigned int verbose = 1;
 module_param(verbose, int, 0644);
 MODULE_PARM_DESC(verbose, "verbose startup messages, default is 1 (ERROR)");
 
@@ -412,6 +412,7 @@ static void video_vip_worker(unsigned long data)
 		return;
 
 	dprintk(SAA716x_DEBUG, 1, "dma buffer = %d", write_index);
+	saa716x_cap_check_input_errors(s);
 
 	if (write_index == vip_entry->read_index) {
 		printk(KERN_DEBUG "%s: called but nothing to do\n", __func__);
@@ -441,7 +442,7 @@ static void video_vip_worker(unsigned long data)
 		cb->vb.vb2_buf.timestamp = ktime_get_ns();
 		cb->vb.sequence = s->sequence++;
 		vb2_buffer_done(&cb->vb.vb2_buf, VB2_BUF_STATE_DONE);
-		printk("%s: vb2_buffer(%d) returned", __func__, cb->vb.vb2_buf.index);
+		pr_debug("%s: vb2_buffer(%d) returned\n", __func__, cb->vb.vb2_buf.index);
 
 		vip_entry->read_index = (vip_entry->read_index + 1) & 7;
 	} while (write_index != vip_entry->read_index);

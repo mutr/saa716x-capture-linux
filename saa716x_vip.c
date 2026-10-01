@@ -123,8 +123,7 @@ static int saa716x_vip_setparams(struct saa716x_dev *saa716x, int port,
 	dma_channel = saa716x->vip[port].dma_channel[0];
 
 	/* number of pages needed for a buffer */
-	num_pages = (stream_params->bits / 8 * stream_params->samples
-		     * stream_params->lines) / SAA716x_PAGE_SIZE;
+	num_pages = (stream_params->pitch * stream_params->lines) / SAA716x_PAGE_SIZE;
 	/* check if these will fit into one page table */
 	if (num_pages > (SAA716x_PAGE_SIZE / 8))
 		saa716x->vip[port].dual_channel = 1;
@@ -136,10 +135,34 @@ static int saa716x_vip_setparams(struct saa716x_dev *saa716x, int port,
 	saa716x_vip_init_ptables(saa716x->vip[port].dma_buf[0],
 				 saa716x->vip[port].dma_channel[0],
 				 stream_params);
-	if (saa716x->vip[port].dual_channel)
+	if (saa716x->vip[port].dual_channel) {
 		saa716x_vip_init_ptables(saa716x->vip[port].dma_buf[1],
 					 saa716x->vip[port].dma_channel[1],
 					 stream_params);
+	} else if (saa716x->vip[port].trap_virt) {
+		/*
+		 * The second channel's page tables are otherwise left with
+		 * whatever the previous stream (or __get_free_page) put there;
+		 * point every entry at a scratch page so stray writes land
+		 * somewhere harmless.
+		 */
+		for (i = 0; i < VIP_BUFFERS; i++) {
+			struct saa716x_dmabuf *db = &saa716x->vip[port].dma_buf[1][i];
+			u32 *pte = db->mem_ptab_virt;
+			int k;
+
+			for (k = 0; k < SAA716x_PTAB_SIZE; k++) {
+				pte[2 * k] = (u32)saa716x->vip[port].trap_phys;
+				pte[2 * k + 1] = (u32)((u64)saa716x->vip[port].trap_phys >> 32);
+			}
+			dma_sync_single_for_device(&saa716x->pdev->dev, db->mem_ptab_phys,
+						   SAA716x_PAGE_SIZE, DMA_TO_DEVICE);
+		}
+		memset(saa716x->vip[port].trap_virt, 0, SAA716x_PAGE_SIZE);
+		saa716x_vip_init_ptables(saa716x->vip[port].dma_buf[1],
+					 saa716x->vip[port].dma_channel[1],
+					 stream_params);
+	}
 
 	/* get module ID */
 	mid = SAA716x_EPRD(vi_port, VI_MODULE_ID);
@@ -376,6 +399,22 @@ int saa716x_vip_stop(struct saa716x_dev *saa716x, int port)
 	SAA716x_EPWR(vi_ch[port], VI_MODE, val);
 	saa716x_set_clk_internal(saa716x, saa716x->vip[port].dma_channel[0]);
 	saa716x->vip[port].read_index = 0;
+
+	if (!saa716x->vip[port].dual_channel && saa716x->vip[port].trap_virt) {
+		u8 *t = saa716x->vip[port].trap_virt;
+		int first = -1, last = -1, i;
+
+		for (i = 0; i < SAA716x_PAGE_SIZE; i++)
+			if (t[i]) {
+				if (first < 0)
+					first = i;
+				last = i;
+			}
+		if (first >= 0)
+			printk(KERN_WARNING "%s: VI%d stray DMA into channel %d: bytes %d..%d, %*ph\n",
+			       __func__, port, saa716x->vip[port].dma_channel[1], first, last,
+			       16, t + first);
+	}
 	
 	return 0;
 }
@@ -406,6 +445,10 @@ int saa716x_vip_init(struct saa716x_dev *saa716x, int port,
 		}
 	}
 	saa716x->vip[port].saa716x = saa716x;
+	saa716x->vip[port].trap_virt = dma_alloc_coherent(&saa716x->pdev->dev,
+			SAA716x_PAGE_SIZE, &saa716x->vip[port].trap_phys, GFP_KERNEL);
+	if (!saa716x->vip[port].trap_virt)
+		return -ENOMEM;
 	tasklet_init(&saa716x->vip[port].tasklet, worker,
 		     (unsigned long)&saa716x->vip[port]);
 	saa716x->vip[port].read_index = 0;
@@ -475,6 +518,10 @@ int saa716x_vip_exit2(struct saa716x_dev *saa716x, int port)
 			saa716x_free_ptable(&saa716x->vip[port].dma_buf[n][i]);
 		}
 	}
+	if (saa716x->vip[port].trap_virt)
+		dma_free_coherent(&saa716x->pdev->dev, SAA716x_PAGE_SIZE,
+				  saa716x->vip[port].trap_virt, saa716x->vip[port].trap_phys);
+	saa716x->vip[port].trap_virt = NULL;
 	return 0;
 }
 EXPORT_SYMBOL_GPL(saa716x_vip_exit2);

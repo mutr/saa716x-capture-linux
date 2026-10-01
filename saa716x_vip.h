@@ -57,6 +57,9 @@ struct saa716x_vip_stream_port {
 	struct saa716x_dmabuf	dma_buf[2][VIP_BUFFERS];
 	struct saa716x_dev	*saa716x;
 	struct tasklet_struct	tasklet;
+	/* page the unused second DMA channel points at in single-channel mode */
+	void			*trap_virt;
+	dma_addr_t		trap_phys;
 };
 
 extern void saa716x_vipint_disable(struct saa716x_dev *saa716x);

@@ -112,10 +112,21 @@ static const u8 echdcap_rx_csc24[] = {
 #define REG_VACTIVE_LO		0x61
 #define REG_VSYNC_VBP		0x62	/* vsync + vbackporch, split not decoded yet */
 #define REG_VFP			0x63
-#define REG_SIGNAL_STATUS	0x65	/* bit0: 0=no signal, 1=signal present/locked */
+/*
+ * 0x10: 0x18 with no input, 0xff/0xbf with a locked signal, 0xfb while the
+ * receiver needs re-init after a source/mode change (vertical not locked).
+ */
+#define REG_STATUS		0x10
+#define STATUS_SIGNAL		BIT(7)
+#define STATUS_VLOCK		BIT(2)
+#define REG_RATE		0x7f	/* bit7 set for 1000/1001 rates (29.97, 59.94, 23.98) */
+#define RATE_1001		BIT(7)
+
+#define REINIT_INTERVAL		(5 * HZ)
 
 struct echdcap_rx_state {
 	struct v4l2_subdev sd;
+	unsigned long last_init;
 };
 
 static inline struct echdcap_rx_state *to_state(struct v4l2_subdev *sd)
@@ -129,13 +140,25 @@ struct echdcap_rx_mode {
 };
 
 /*
- * Known modes, matched purely on detected geometry (pixel clock is not
- * decoded yet). Values come from register snapshots recorded in TODO.md.
+ * Modes matched on measured geometry; the receiver does not expose a pixel
+ * clock we could decode. Every mode this card accepts (<= ~85 MHz) has a
+ * unique total size, except the 1000/1001 variants, see REG_RATE.
+ * Geometry measured from a Windows source, modes/ dumps in the repo notes.
  */
 static const struct echdcap_rx_mode echdcap_rx_modes[] = {
 	{ 1920, 1080, 2200, 1125, V4L2_DV_BT_CEA_1920X1080P30 },
+	{ 1920, 1080, 2640, 1125, V4L2_DV_BT_CEA_1920X1080P25 },
+	{ 1920, 1080, 2750, 1125, V4L2_DV_BT_CEA_1920X1080P24 },
 	{ 1280,  720, 1650,  750, V4L2_DV_BT_CEA_1280X720P60 },
 	{ 1280,  720, 1980,  750, V4L2_DV_BT_CEA_1280X720P50 },
+	{ 1360,  768, 1792,  795, V4L2_DV_BT_DMT_1360X768P60 },
+	{ 1024,  768, 1344,  806, V4L2_DV_BT_DMT_1024X768P60 },
+	{ 1024,  768, 1328,  806, V4L2_DV_BT_DMT_1024X768P70 },
+	{ 1024,  768, 1312,  800, V4L2_DV_BT_DMT_1024X768P75 },
+	{ 1024,  768, 1328,  800, V4L2_DV_BT_DMT_1024X768P75 },	/* Intel 75.03 Hz */
+	{  800,  600, 1056,  628, V4L2_DV_BT_DMT_800X600P60 },
+	{  800,  600, 1040,  666, V4L2_DV_BT_DMT_800X600P72 },
+	{  800,  600, 1056,  625, V4L2_DV_BT_DMT_800X600P75 },
 	{  800,  600, 1048,  631, V4L2_DV_BT_DMT_800X600P85 },
 };
 
@@ -149,36 +172,39 @@ static int echdcap_rx_read(struct v4l2_subdev *sd, u8 reg)
 	return val;
 }
 
+static int echdcap_rx_hw_init(struct i2c_client *client);
+
 static int echdcap_rx_g_input_status(struct v4l2_subdev *sd, u32 *status)
 {
-	int val = echdcap_rx_read(sd, REG_SIGNAL_STATUS);
+	int val = echdcap_rx_read(sd, REG_STATUS);
 
 	if (val < 0)
 		return val;
 
-	if (val & 0x01) {
-		*status &= ~V4L2_IN_ST_NO_SIGNAL;
-	} else {
+	*status &= ~(V4L2_IN_ST_NO_SIGNAL | V4L2_IN_ST_NO_V_LOCK);
+	if (!(val & STATUS_SIGNAL))
 		*status |= V4L2_IN_ST_NO_SIGNAL;
-	}
+	else if (!(val & STATUS_VLOCK))
+		*status |= V4L2_IN_ST_NO_V_LOCK;
 
 	return 0;
 }
 
-static int echdcap_rx_query_dv_timings(struct v4l2_subdev *sd,
-					struct v4l2_dv_timings *timings)
+static int echdcap_rx_detect(struct v4l2_subdev *sd, struct v4l2_dv_timings *timings)
 {
-	int sig, r59, r5a, r5b, r5c, r5d, r5e, r5f, r60, r61, r62, r63;
+	int sig, rate, r59, r5a, r5b, r5c, r5d, r5e, r5f, r60, r61, r62, r63;
 	u32 htotal, hactive, hsync, hfp, hbp, vtotal, vactive, vfp;
 	int i;
 
 	memset(timings, 0, sizeof(*timings));
 
-	sig = echdcap_rx_read(sd, REG_SIGNAL_STATUS);
+	sig = echdcap_rx_read(sd, REG_STATUS);
 	if (sig < 0)
 		return sig;
-	if (!(sig & 0x01))
+	if (!(sig & STATUS_SIGNAL))
 		return -ENOLINK;
+	if (!(sig & STATUS_VLOCK))
+		return -ENOLCK;
 
 	r59 = echdcap_rx_read(sd, REG_HTOTAL_LO);
 	r5a = echdcap_rx_read(sd, REG_H_GEOM_HI);
@@ -217,8 +243,13 @@ static int echdcap_rx_query_dv_timings(struct v4l2_subdev *sd,
 		const struct echdcap_rx_mode *m = &echdcap_rx_modes[i];
 
 		if (m->hactive == hactive && m->vactive == vactive &&
-		    m->htotal == htotal && m->vtotal == vtotal) {
+		    abs((int)m->htotal - (int)htotal) <= 1 &&
+		    abs((int)m->vtotal - (int)vtotal) <= 1) {
 			*timings = m->timings;
+			rate = echdcap_rx_read(sd, REG_RATE);
+			if (rate >= 0 && (rate & RATE_1001) &&
+			    (timings->bt.flags & V4L2_DV_FL_CAN_REDUCE_FPS))
+				timings->bt.flags |= V4L2_DV_FL_REDUCED_FPS;
 			return 0;
 		}
 	}
@@ -229,17 +260,40 @@ static int echdcap_rx_query_dv_timings(struct v4l2_subdev *sd,
 	return -ERANGE;
 }
 
+static int echdcap_rx_reinit(struct v4l2_subdev *sd)
+{
+	struct echdcap_rx_state *state = to_state(sd);
+	int ret;
+
+	ret = echdcap_rx_hw_init(v4l2_get_subdevdata(sd));
+	state->last_init = jiffies;
+	dprintk(sd, 1, "receiver re-init: %d\n", ret);
+	return ret;
+}
+
 /*
- * This receiver free-runs to whatever HDMI source is connected and has no
- * known register writes to program a specific mode (see TODO.md item 8), so
- * there is nothing to do here. It exists so that callers of s_dv_timings
- * (i.e. the saa716x bridge driver's VIDIOC_S_DV_TIMINGS handler) succeed and
- * can update their own idea of the current timings from query_dv_timings().
+ * After the source changes mode the receiver keeps measuring lines but
+ * loses vertical lock until its init sequence is run again (the Windows
+ * driver does the same), so retry once after a rate-limited re-init.
  */
+static int echdcap_rx_query_dv_timings(struct v4l2_subdev *sd,
+					struct v4l2_dv_timings *timings)
+{
+	struct echdcap_rx_state *state = to_state(sd);
+	int ret = echdcap_rx_detect(sd, timings);
+
+	if ((ret == -ENOLCK || ret == -ERANGE) &&
+	    time_after(jiffies, state->last_init + REINIT_INTERVAL) &&
+	    !echdcap_rx_reinit(sd))
+		ret = echdcap_rx_detect(sd, timings);
+	return ret;
+}
+
+/* Re-run the receiver init so its mode-dependent setup matches the new signal. */
 static int echdcap_rx_s_dv_timings(struct v4l2_subdev *sd,
 				    struct v4l2_dv_timings *timings)
 {
-	return 0;
+	return echdcap_rx_reinit(sd);
 }
 
 static const struct v4l2_subdev_video_ops echdcap_rx_video_ops = {
@@ -322,7 +376,7 @@ static int echdcap_rx_probe(struct i2c_client *client, const struct i2c_device_i
 	v4l2_i2c_subdev_init(sd, client, &echdcap_rx_ops);
 	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
 
-	val = i2c_smbus_read_byte_data(client, REG_SIGNAL_STATUS);
+	val = i2c_smbus_read_byte_data(client, REG_STATUS);
 	if (val < 0) {
 		v4l2_err(sd, "no response at 0x%02x (%s): %d\n",
 			 client->addr, client->adapter->name, val);
@@ -334,6 +388,8 @@ static int echdcap_rx_probe(struct i2c_client *client, const struct i2c_device_i
 
 		if (ret)
 			return ret;
+		state->last_init = jiffies;
+		val = i2c_smbus_read_byte_data(client, REG_STATUS);
 		v4l2_info(sd, "receiver init done\n");
 	}
 

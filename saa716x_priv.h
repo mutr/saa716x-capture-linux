@@ -146,6 +146,13 @@ struct saa716x_stream {
 	unsigned			mmu_q_index;
 
 	struct v4l2_subdev	*sd_receiver;	
+
+	/* ECHDCAP: restart the VIP after input errors (signal glitches) */
+	struct delayed_work	restart_work;
+	struct delayed_work	watch_work;
+	unsigned long		last_frame;	/* jiffies */
+	bool			streaming;
+	unsigned int		restarts;
 };
 
 struct saa716x_config {
@@ -225,6 +232,9 @@ struct saa716x_dev {
 
 	/* debugfs */
 	struct dentry 		*debugfs_root;
+
+	/* StarTech ECHDCAP: HPD/watchdog MCU on the GPIO bit-banged I2C bus */
+	struct echdcap_mcu	*echdcap_mcu;
 };
 
 /* PCI */
